@@ -1,0 +1,1 @@
+Renders the provided SVG markup to a PNG and routes it for review. For image-capable models the PNG is attached to the tool result for self-critique; for text-only models the render is saved to the workspace cache, opened in the OS viewer, and gated on human approve/reject (rejection feedback is returned as the tool error).
