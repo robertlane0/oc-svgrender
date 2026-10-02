@@ -1,6 +1,13 @@
 # `render_svg` — Implementation Plan
 
-> Source of truth for behavior: [`PLUGIN.md`](./PLUGIN.md) (architecture spec, grounded in OpenCode `dev` at paths cited inline). This document is the **step-by-step build plan** — what to create, in what order, and how to verify each step. Keep it in sync with `PLUGIN.md`; if they conflict, `PLUGIN.md:1` is canonical for product decisions.
+> Source of truth for behavior: [`PLUGIN.md`](./PLUGIN.md) (architecture spec). This document is the **step-by-step build plan** — what to create, in what order, and how to verify each step. Keep it in sync with `PLUGIN.md`; if they conflict, `PLUGIN.md:1` is canonical for product decisions.
+
+> **Platform:** everything below was written against OpenCode v1.18 and has been **ported to v2** (the
+> current plugin API). The v1-shaped citations in the phase text are historical; read
+> [`PLUGIN.md` §0](PLUGIN.md#0-platform-migration-v1--v2) for the current API mapping and the three
+> host constraints (JSON-only metadata, process-wide WASM init, bounded capability lookup) that
+> testing against v2.0.21 established. `src/index.ts`, `src/render_svg.ts`, and `src/models.ts` are the
+> files those phases now produce; the phase numbering below still describes the same order of work.
 
 ## 0. How to use this plan
 
@@ -522,9 +529,27 @@ Use `bun:test` (aligns with repo's `bun.lock` and `opencode`'s runner) or `vites
 
 ### 9.3 Manual end-to-end
 
-1. **Multimodal sim:** run a test harness that sets `modelBySession` to a fake image-capable model, calls the tool, and inspects that `data:image/png;base64,` decodes to a viewable PNG. Open the PNG manually.
-2. **Human path:** `bun --cwd packages/opencode dev` in a tmux session is not needed for the standalone plugin (there is no TUI to start), but you can exercise `open()` + `ctx.ask()` via a stub CLI that calls `render_svg` and prints `metadata.preview` length.
-3. **Viewer check:** on macOS run `open` path in Terminal; on Linux `xdg-open`; on CI set `autoOpenViewer: false`.
+Unit tests do not exercise the host. The v2 port added a live check that does, and it is the step that
+found the three host constraints in `PLUGIN.md` §0 — keep it part of any future change to the tool's
+result shape.
+
+1. **Install into a real instance.** Add the package to `opencode.json`
+   (`{ "plugins": [{ "package": "/path/to/oc-svgrender" }] }`) or rely on the watched
+   `.opencode/plugins/render-svg.ts` shim for a checkout, then confirm it is active:
+   `curl -u opencode:$PASSWORD "http://127.0.0.1:PORT/api/plugin?directory=…" | jq '.data[] | select(.source.type != "builtin")'`
+   should list `render-svg`. A plugin that does not appear here never registered its tool.
+2. **Multimodal route:** `opencode run --model <image-capable model> "…"` with a prompt that forces
+   `render_svg` and then asks something only visible in the render. The model answering the visual
+   question is the proof; a correct guess from markup alone is not. Confirm the tool part really
+   carries the image rather than trusting the transcript:
+   `…/api/session/<id>/message` → the `render_svg` part is `completed`, has `metadata.route ==
+   "multimodal"`, and one content entry of `type: "file"` with a `data:image/png;base64,` `uri`.
+3. **Text-only route:** same with a text-only model. Expect `route: "human"`, **no** file content part,
+   and a `preview` data URL in `metadata`. Confirm the PNG exists in `.opencode/render-svg/<session>/`.
+4. **Reload check:** edit any file under `src/`, which makes OpenCode re-evaluate the plugin graph, and
+   render again. This is the case that breaks a module-scoped WASM memo, so it is not optional.
+5. **Viewer check:** on macOS the `open` path in Terminal; on Linux `xdg-open`; headless/CI set
+   `autoOpenViewer: false`.
 
 ### 9.4 Typecheck & lint
 
@@ -544,8 +569,9 @@ Follow `opencode/AGENTS.md: Testing` (no mocks unless needed, test real impl) an
 - [ ] Validator runs **before** rasterizer; stripped markup is what gets rasterized, cached, and shown to human.
 - [ ] No raw `svg` string is ever sent to a client as `image/svg+xml`; only rasterized `image/png` (`data:image/png;base64,`) is attached or in `metadata.preview` (`PLUGIN.md:426-431`).
 - [ ] Resvg is configured to **not** fetch network resources. Add a test that an SVG with `<image href="https://example.com/x.png">` either fails validation or renders without performing a fetch (stub `fetch` and assert not called).
-- [ ] `ctx.ask`'s `always` pattern does not introduce a wildcard allow for unrelated permissions — scope is `permission: "render_svg"` only.
+- [ ] The tool declares `options.permission: "render_svg"` and nothing broader, so a `deny` rule can only target this tool (`packages/core/src/tool.ts` `whollyDisabled`).
 - [ ] Document that `forceHumanReview` is the intended control for deployments that require human gate even for multimodal models (`PLUGIN.md:324`).
+- [ ] In v2 there is no `ctx.ask()`, so the plugin cannot itself grant or deny: confirm the README states that gating is configuration, not that the tool prompts.
 
 ---
 
@@ -568,10 +594,10 @@ For Option B (in-tree), documentation lives in `opencode`'s tool registry and `o
 |---|---|---|
 | **M1 Scaffolding** | Package installs, `tsc` passes, `render_svg.txt` exists | `package.json`, `src/` skeleton |
 | **M2 Shared libs** | Validator + rasterizer + cache + summary pass unit tests | `src/validate.ts`, `src/rasterize.ts`, `src/cache.ts`, `src/summarize.ts`, `test/fixtures/` |
-| **M3 Capability cache** | `chat.params` hook populates `modelBySession`; empty-cache fallback is Path B | `src/index.ts` hook + test |
-| **M4 Tool wired** | `render_svg` registered via `Plugin` and callable with valid SVG | `src/render_svg.ts` + `src/index.ts#tool` |
-| **M5 Path A** | Multimodal call returns PNG attachment, no `ask` | Integration test green |
-| **M6 Path B** | Non-multimodal call writes cache, calls `open` (swallowed on fail), blocks on `ask`, propagates `CorrectedError` | Integration test green |
+| **M3 Capability cache** | `session.hook("model.request")` populates the session→model cache; unknown session is Path B; catalog lookup is time-bounded | `src/models.ts` + test |
+| **M4 Tool wired** | `render_svg` registered via `ctx.tool.transform` and callable with valid SVG | `src/render_svg.ts` + `src/index.ts#setup` |
+| **M5 Path A** | Multimodal call returns the PNG as a `file` content part | Integration test green + live check §9.3 |
+| **M6 Path B** | Non-multimodal call writes cache, calls `open` (swallowed on fail), returns path + summary, publishes `preview` in metadata | Integration test green + live check §9.3 |
 | **M7 Config & polish** | All `RenderSvgOptions` honored, cache dir customizable, `AGENTS.md`/`README` accurate | `src/config.ts`, docs |
 | **M8 Hardening** | Security checklist passes, no raw SVG to clients, no network fetch | Security tests |
 | **M9 Release** | `bun tsc --noEmit` + all tests green on macOS/Linux, manual PNG viewable | Tag + publish |
@@ -584,8 +610,9 @@ Global acceptance: `PLUGIN.md:395-446` behavior table and `PLUGIN.md:152-194` fl
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| `chat.params` hook signature drift | Capability cache breaks | Pin `@opencode-ai/plugin` version; re-verify §2 checklist on upgrade; fall back to Path B on miss (safe). |
-| WASM init cost on first call | Latency spike, timeout | Lazy-init and cache promise; add `await initWasm` with 5s timeout that falls back to clear error. |
+| `chat.params` hook signature drift | Capability cache breaks | Pin `@opencode-ai/plugin` version; re-verify §2 checklist on upgrade; fall back to Path B on miss (safe). In v2 the hook is `session.hook("model.request")`; the same "unknown ⇒ Path B" rule covers a rename. |
+| A tool result the host cannot encode is dropped, not reported | The model sees "Provider did not return a tool result" and the render is lost with no plugin-side error | `metadata()` strips `undefined` (§0 constraint 1); the live check in §9.3 asserts the tool part is `completed` with a `file` content part, which is the only place this failure is visible. |
+| WASM init cost on first call | Latency spike, timeout | Lazy-init and cache promise; add `await initWasm` with 5s timeout that falls back to clear error. The memo must live on `globalThis`, not in module scope (§0 constraint 2). |
 | `open()` not available (headless/SSH) | Viewer fails | Honor `autoOpenViewer: false`; always swallow `open` rejection; include `cachePath` so user can `cat`/`scp`. |
 | Bun vs Node `import ... with {type}` | Description load fails | Use `Bun.file` read for `render_svg.txt` if static import is unsupported in consumer's bundler; provide both paths. |
 | SVG bomb (deeply nested `<use>`) | OOM | Depth cap + `maxPixels` + `maxSvgBytes` enforced in validator, not just rasterizer. |

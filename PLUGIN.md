@@ -2,11 +2,69 @@
 
 ### A self-verifying SVG rendering tool for OpenCode plugins
 
-**Status:** Draft
-**Target platform:** OpenCode (`packages/plugin`, `packages/opencode`)
+**Status:** Implemented. Written against OpenCode **v1.18**; the v1 API references below are kept as the
+original rationale, and every v2 divergence is called out in [§0](#0-platform-migration-v1--v2).
+**Target platform:** OpenCode v2 (`packages/plugin`, `packages/core`, `packages/schema`)
 **Author's note:** Every claim about existing OpenCode internals in this document is grounded in the
-current OpenCode source tree (paths cited inline). Sections describing the new plugin's own code are
-proposed design, not existing code.
+OpenCode source tree (paths cited inline). Sections describing the new plugin's own code are design
+plus what shipped.
+
+---
+
+## 0. Platform migration (v1 → v2)
+
+The design below is unchanged in intent: the same validation, the same rasterizer, the same two routes.
+What changed is the host API the plugin is written against, and one capability that no longer exists.
+
+| Concern | OpenCode v1.18 | OpenCode v2 (current) |
+|---|---|---|
+| Plugin shape | `Plugin = (input, options) => Promise<Hooks>` | `Plugin.define({ id, setup(ctx) })`, where `ctx.options` carries plugin options |
+| Tool registration | return `{ tool: { render_svg } }` from the plugin | `await ctx.tool.transform((editor) => editor.add(tool))` |
+| Tool value | `tool({ description, args, execute })` | plain object: `{ name, description, input, options, execute }` |
+| Argument schema | zod (`tool.schema.string()`) | `input` may be an effect `Schema`, a Standard Schema, or plain JSON Schema. This plugin uses **plain JSON Schema** so no second copy of zod/effect can disagree with the host's `instanceof` checks |
+| Working directory | `ctx.worktree` / `PluginInput.directory` | `ctx.location.directory` |
+| Progress/title | `ctx.metadata({ title })` | `await ctx.progress({ title })` |
+| Model capability | `chat.params` hook exposes the active `Model` | `session.hook("model.request")` exposes `Model.Ref`; capabilities come from `ctx.model.list()` |
+| Image capability field | `model.capabilities.input.image === true` | `model.capabilities.input.includes("image")` (`input` is now a `string[]`) |
+| Result text | `ToolResult.output: string` | `ToolResult.content: string \| Content[]`; declaring an `output` schema makes the field mandatory, and no schema means `output` must be absent |
+| Image attachment | `ToolResult.attachments[]` with a `url` | a `content` entry of `{ type: "file", uri: "data:image/png;base64,…", mime, name }`. A non-`data:` URI is decoded as raw base64 and the model sees a broken image |
+| Tool call id | `ctx.messageID` (no per-call id) | `ctx.id` (`Tool.CallID`), already unique per call |
+| Error signalling | `throw` an `Error`; the host stringifies it into a tool error | promise tools run inside `Effect.promise`, where a rejection is a **defect that fails the step**. Tools must catch everything and return text |
+| Tool metadata | free-form | encoded on `session.tool.success` as `Record<string, Json>`; an explicit `undefined` value fails the encode and the result is dropped |
+
+### What was lost: `ctx.ask()`
+
+v1 plugins could call `ctx.ask()` and get a real approve/reject prompt, with the human's free-text
+rejection comment propagated back as the tool error. v2 does not expose that: `ctx.permission` is
+`list`/`get`/`reply` only, and requests are created by core tools holding the `Permission` service, which
+an external plugin cannot reach. Built-in tools that need a prompt (`question`, `shell`, `write`) get it
+because they live in `packages/core`.
+
+Consequences for this plugin:
+
+- Path B is *visible* human review, not a *blocking* gate: cache the render, open it in the OS viewer,
+  put the data URL in tool `metadata` (a UI-only channel the model never receives), and tell the model
+  the path and a structural summary.
+- Gating is configuration. The tool declares `options.permission: "render_svg"`, so a `deny` rule removes
+  it from the catalog: `{ "permission": { "render_svg": "deny" } }`.
+- An interactive prompt for renders would need a core API change or a TUI plugin driving the dialog.
+
+### Three host-facing constraints discovered by testing against v2.0.21
+
+These were found by installing the plugin and reading its renders in a live session, not by reading the
+source; each has a regression test.
+
+1. **Tool metadata must be pure JSON.** `session.tool.success` encodes `metadata` as
+   `Record<string, Json>`. One `undefined` value fails the encode, the event never publishes, the tool
+   part stays `running` forever, and the next request carries "Provider did not return a tool result" —
+   the model never sees the render. Keys are dropped instead of set to `undefined`.
+2. **The rasterizer memo must be process-wide.** OpenCode re-evaluates a watched local plugin's module
+   graph on every source change, and resvg's `initWasm()` is one-shot per process. A module-scoped memo
+   therefore re-initializes on reload and fails with "Already initialized". The memo lives on a
+   `Symbol.for` key on `globalThis`.
+3. **Capability lookups must be bounded.** A cold `ctx.model.list()` can block on a slow catalog fetch.
+   OpenCode marks a still-running tool as missing and continues, so an unbounded lookup silently loses
+   the result. The lookup has a time budget and degrades to the text-only route.
 
 ---
 
