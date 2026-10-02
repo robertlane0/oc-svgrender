@@ -3,12 +3,14 @@
   "version": "0.2.0",
   "description": "OpenCode v2 plugin providing a render_svg tool: validate + rasterize SVG to PNG and route the render for multimodal self-critique or human review.",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./index.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/index.ts"
+    ".": "./index.ts",
+    "./server": "./server.ts"
   },
   "files": [
+    "index.ts",
+    "server.ts",
     "src",
     "README.md",
     "LICENSE"

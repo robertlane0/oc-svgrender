@@ -46,6 +46,11 @@ watches it, so edits reload without a restart:
 { "plugins": [{ "package": "/path/to/oc-svgrender" }] }
 ```
 
+> A directory install is resolved by probing `<package>/server` and then the
+> package root — as files, not through the `exports` map. A package whose entry
+> lives only under `src/` is therefore skipped with no error in the log, which is
+> why this repo ships root-level `index.ts` and `server.ts` re-exports.
+
 This repository is installed into the local instance at
 `~/.config/opencode/opencode.json`. Consumers should gitignore the render cache
 (`.opencode/render-svg/`).
@@ -134,6 +139,9 @@ bun install
 bun run typecheck
 bun test
 ```
+
+Layout: the implementation is in `src/`; `index.ts` and `server.ts` at the root are
+re-exports so a directory install resolves (see Install).
 
 Live check against the local instance:
 

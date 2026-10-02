@@ -536,8 +536,18 @@ result shape.
 1. **Install into a real instance.** Add the package to `opencode.json`
    (`{ "plugins": [{ "package": "/path/to/oc-svgrender" }] }`) or rely on the watched
    `.opencode/plugins/render-svg.ts` shim for a checkout, then confirm it is active:
-   `curl -u opencode:$PASSWORD "http://127.0.0.1:PORT/api/plugin?directory=…" | jq '.data[] | select(.source.type != "builtin")'`
-   should list `render-svg`. A plugin that does not appear here never registered its tool.
+
+   ```bash
+   curl -s -u "opencode:$PASSWORD" -G "http://127.0.0.1:$PORT/api/plugin" \
+     --data-urlencode "location[directory]=$PWD" \
+     | jq '.data[] | select(.source.type != "builtin") | {id, status: .state.status}'
+   ```
+
+   The endpoint takes `location[directory]`, **not** `directory`; a bare `directory`
+   parameter is ignored and the response describes the server's default location
+   instead, which reads as "my plugin is missing". `render-svg` must appear with
+   status `active`; a plugin absent here never registered its tool, and a directory
+   package whose entry lives only under `src/` is skipped silently (`PLUGIN.md` §0).
 2. **Multimodal route:** `opencode run --model <image-capable model> "…"` with a prompt that forces
    `render_svg` and then asks something only visible in the render. The model answering the visual
    question is the proof; a correct guess from markup alone is not. Confirm the tool part really

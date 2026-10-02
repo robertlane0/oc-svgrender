@@ -65,6 +65,12 @@ source; each has a regression test.
 3. **Capability lookups must be bounded.** A cold `ctx.model.list()` can block on a slow catalog fetch.
    OpenCode marks a still-running tool as missing and continues, so an unbounded lookup silently loses
    the result. The lookup has a time budget and degrades to the text-only route.
+4. **A directory install needs root-level entry files.** `Host.resolve` (`packages/plugin/src/host.ts`)
+   probes `<package>/server` and then the package root, and `Bun.resolveSync` on a *directory* does not
+   consult the `exports` map a bare specifier would use. A package whose entry is only reachable as
+   `src/index.ts` is dropped during the config-plugin scan with nothing logged, so the tool simply never
+   appears. `index.ts` and `server.ts` at the repo root are re-exports that exist for this reason;
+   `src/index.ts` holds the implementation.
 
 ---
 
