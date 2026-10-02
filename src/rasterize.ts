@@ -27,24 +27,42 @@ export type RasterizeOpts = {
   background: "white" | "transparent"
 }
 
-let wasmReady: Promise<void> | undefined
+/**
+ * `initWasm()` may be called exactly once per process, but this module can be
+ * evaluated several times in one process: OpenCode reloads a local plugin's
+ * module graph whenever a watched source file changes, and each evaluation
+ * gets a fresh binding while `@resvg/resvg-wasm` stays a singleton underneath.
+ * The memo therefore lives on `globalThis` under a well-known key, so a reloaded
+ * copy joins the first initialization instead of racing it.
+ */
+const WASM = Symbol.for("opencode-plugin-render-svg/resvg-wasm")
+
+type WasmScope = { [WASM]?: Promise<void> }
 
 function ensureWasm(): Promise<void> {
-  if (!wasmReady) {
-    wasmReady = (async () => {
-      const { readFile } = await import("node:fs/promises")
-      const { createRequire } = await import("node:module")
-      const require = createRequire(import.meta.url)
-      const wasmPath = require.resolve("@resvg/resvg-wasm/index_bg.wasm")
-      const bytes = await readFile(wasmPath)
+  const scope = globalThis as WasmScope
+  const existing = scope[WASM]
+  if (existing) return existing
+  const pending = (async () => {
+    const { readFile } = await import("node:fs/promises")
+    const { createRequire } = await import("node:module")
+    const require = createRequire(import.meta.url)
+    const wasmPath = require.resolve("@resvg/resvg-wasm/index_bg.wasm")
+    const bytes = await readFile(wasmPath)
+    try {
       await initWasm(bytes)
-    })()
-    // Allow retry after failure: reset the cached promise on rejection.
-    wasmReady.catch(() => {
-      wasmReady = undefined
-    })
-  }
-  return wasmReady
+    } catch (error) {
+      // Something else already initialized the module: that state is shared and
+      // usable, so this is a success rather than a failure.
+      if (!/already initialized/i.test(error instanceof Error ? error.message : String(error))) throw error
+    }
+  })()
+  scope[WASM] = pending
+  // Allow a later call to retry initialization after a genuine failure.
+  pending.catch(() => {
+    if (scope[WASM] === pending) delete scope[WASM]
+  })
+  return pending
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -87,9 +105,7 @@ export async function rasterizeSvg(svg: string, opts: RasterizeOpts): Promise<Pn
     image.free()
     return result
   } catch (err) {
-    throw new RenderError(
-      `SVG render failed: ${err instanceof Error ? err.message : String(err)}`,
-    )
+    throw new RenderError(`SVG render failed: ${err instanceof Error ? err.message : String(err)}`)
   } finally {
     resvg?.free()
   }

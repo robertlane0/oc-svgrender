@@ -1,219 +1,244 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, stat } from "node:fs/promises"
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { ToolContext } from "@opencode-ai/plugin"
+import type { ToolContext } from "@opencode/plugin/promise/tool"
+import { Schema } from "effect"
 import { resolveOptions } from "../src/config.ts"
-import { createRenderSvgTool } from "../src/render_svg.ts"
+import type { RenderSvgOptions } from "../src/config.ts"
+import { createRenderSvgTool, input, parseInput, PERMISSION, TOOL_NAME } from "../src/render_svg.ts"
 
 const VALID =
   '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>'
 
-const MULTIMODAL = { capabilities: { input: { image: true } } }
-const TEXT_ONLY = { capabilities: { input: { image: false } } }
-
 let suffix = 0
 
-function makeCtx(overrides: Partial<ToolContext> & { worktree: string }): ToolContext {
-  const { worktree, ...rest } = overrides
+function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
   return {
-    sessionID: "ses-test",
-    messageID: "msg-test",
-    agent: "build",
-    directory: worktree,
-    worktree,
-    abort: new AbortController().signal,
-    metadata: () => {},
-    ask: async () => {},
-    ...rest,
+    sessionID: "ses-test" as ToolContext["sessionID"],
+    agent: "build" as ToolContext["agent"],
+    messageID: "msg-test" as ToolContext["messageID"],
+    id: "call-1" as ToolContext["id"],
+    progress: async () => {},
+    signal: new AbortController().signal,
+    ...overrides,
   }
 }
 
-async function freshWorktree(): Promise<string> {
+async function freshDir(): Promise<string> {
   return mkdtemp(path.join(tmpdir(), "render-svg-tool-"))
 }
 
+function makeTool(
+  options: RenderSvgOptions,
+  acceptsImage: boolean,
+  directory: string,
+  opened: string[] = [],
+) {
+  return createRenderSvgTool({
+    options: resolveOptions(options),
+    directory,
+    acceptsImage: async () => acceptsImage,
+    openFile: async (p) => {
+      opened.push(p)
+    },
+    nextCallSuffix: () => `t${(suffix += 1)}`,
+  })
+}
+
+type Content = { type: string; text?: string; uri?: string; mime?: string; name?: string }
+
+function partsOf(result: { content?: string | readonly Content[] }): Content[] {
+  return typeof result.content === "string" ? [{ type: "text", text: result.content }] : [...(result.content ?? [])]
+}
+
+function textOf(result: { content?: string | readonly Content[] }): string {
+  return partsOf(result)
+    .filter((part) => part.type === "text")
+    .map((part) => part.text ?? "")
+    .join("\n")
+}
+
+function imagesOf(result: { content?: string | readonly Content[] }): Content[] {
+  return partsOf(result).filter((part) => part.type === "file")
+}
+
+describe("tool definition", () => {
+  test("registers as render_svg with a model-callable catalog entry", async () => {
+    const tool = makeTool({}, true, await freshDir())
+    expect(tool.name).toBe(TOOL_NAME)
+    expect(tool.options?.codemode).toBe(false)
+    expect(tool.options?.permission).toBe(PERMISSION)
+    expect(tool.description.length).toBeGreaterThan(0)
+  })
+
+  test("input is plain JSON Schema requiring only svg", () => {
+    expect(input.required).toEqual(["svg"])
+    expect(input.additionalProperties).toBe(false)
+    expect(input.properties.background.enum).toEqual(["transparent", "white"])
+  })
+})
+
+describe("parseInput", () => {
+  test("rejects a missing or non-string svg", () => {
+    expect(parseInput({}).ok).toBe(false)
+    expect(parseInput({ svg: "  " }).ok).toBe(false)
+    expect(parseInput("nope").ok).toBe(false)
+    expect(parseInput({ svg: VALID }).ok).toBe(true)
+  })
+
+  test("rejects out-of-range edges and unknown backgrounds with actionable text", () => {
+    const width = parseInput({ svg: VALID, width: 9000 })
+    expect(width.ok).toBe(false)
+    expect(width.ok === false && width.message).toContain("width")
+    const background = parseInput({ svg: VALID, background: "black" })
+    expect(background.ok === false && background.message).toContain("transparent")
+  })
+
+  test("keeps optional fields", () => {
+    const parsed = parseInput({ svg: VALID, title: "t", width: 10, background: "white" })
+    expect(parsed.ok && parsed.value).toEqual({ svg: VALID, title: "t", width: 10, background: "white" })
+  })
+})
+
 describe("render_svg routing", () => {
-  test("Path A: multimodal returns PNG attachment, no ask", async () => {
-    const worktree = await freshWorktree()
-    let asked = false
-    const tool = createRenderSvgTool(resolveOptions({}), {
-      getModel: () => MULTIMODAL,
-      openFile: async () => {},
-      nextCallSuffix: () => `a${(suffix += 1)}`,
-    })
-    const ctx = makeCtx({
-      worktree,
-      ask: async () => {
-        asked = true
-      },
-    })
-    const result = (await tool.execute({ svg: VALID }, ctx)) as {
-      output: string
-      attachments: { mime: string; url: string }[]
-    }
-    expect(asked).toBe(false)
-    expect(result.attachments.length).toBe(1)
-    expect(result.attachments[0].mime).toBe("image/png")
-    expect(result.attachments[0].url.startsWith("data:image/png;base64,")).toBe(true)
-    expect(result.output).toMatch(/continue iterating/i)
+  test("Path A: multimodal attaches the PNG and never opens a viewer", async () => {
+    const directory = await freshDir()
+    const opened: string[] = []
+    const tool = makeTool({}, true, directory, opened)
+    const result = await tool.execute({ svg: VALID, title: "smoke" }, makeCtx())
+    const images = imagesOf(result)
+    expect(images.length).toBe(1)
+    expect(images[0]?.mime).toBe("image/png")
+    expect(images[0]?.uri?.startsWith("data:image/png;base64,")).toBe(true)
+    expect(Buffer.from(images[0]!.uri!.split(",")[1]!, "base64").subarray(0, 4)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+    )
+    expect(textOf(result)).toMatch(/continue iterating/i)
+    const metadata = result.metadata as Record<string, unknown>
+    expect(metadata["route"]).toBe("multimodal")
+    expect(metadata["width"]).toBe(100)
+    expect(opened).toEqual([])
+    expect((await stat(String(metadata["png"]))).isFile()).toBe(true)
+    expect(await readFile(String(metadata["svg"]), "utf8")).toBe(VALID)
   })
 
-  test("Path B approved: writes cache, opens viewer, returns summary", async () => {
-    const worktree = await freshWorktree()
-    let askedWith: unknown
-    let opened: string[] = []
-    const tool = createRenderSvgTool(resolveOptions({}), {
-      getModel: () => undefined,
-      openFile: async (p) => {
-        opened.push(p)
-      },
-      nextCallSuffix: () => `b${(suffix += 1)}`,
-    })
-    const ctx = makeCtx({
-      worktree,
-      sessionID: "ses-b",
-      ask: async (input) => {
-        askedWith = input
-      },
-    })
-    const result = (await tool.execute({ svg: VALID, title: "Test" }, ctx)) as {
-      title: string
-      output: string
-      metadata: Record<string, unknown>
-    }
-    expect(opened.length).toBe(1)
-    const asked = askedWith as {
-      permission: string
-      patterns: string[]
-      always: string[]
-      metadata: Record<string, unknown>
-    }
-    expect(asked.permission).toBe("render_svg")
-    expect(asked.patterns).toEqual(opened)
-    expect(asked.always).toEqual(["*"])
-    expect(typeof asked.metadata["preview"]).toBe("string")
-    expect(String(asked.metadata["preview"]).startsWith("data:image/png;base64,")).toBe(true)
-    expect(result.output).toMatch(/approved/)
-    expect(result.output).toContain(String(result.metadata["cachePath"]))
-    // Cache files exist on disk.
-    expect((await stat(String(result.metadata["cachePath"]))).isFile()).toBe(true)
-    const pngPath = String(asked.metadata["cachePath"])
-    expect((await stat(pngPath)).isFile()).toBe(true)
-    const svgBack = await readFile(String(result.metadata["cachePath"]), "utf8")
-    expect(svgBack).toBe(VALID)
+  test("Path B: text-only model gets a path and summary, no image, viewer opened", async () => {
+    const directory = await freshDir()
+    const opened: string[] = []
+    const tool = makeTool({}, false, directory, opened)
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect(imagesOf(result).length).toBe(0)
+    const body = textOf(result)
+    const metadata = result.metadata as Record<string, unknown>
+    expect(body).toContain(String(metadata["png"]))
+    expect(body).toContain("cannot see images")
+    expect(body).toContain("1 <rect>")
+    expect(metadata["route"]).toBe("human")
+    expect(opened).toEqual([String(metadata["png"])])
+    expect(String(metadata["preview"]).startsWith("data:image/png;base64,")).toBe(true)
+    expect((await stat(String(metadata["svg"]))).isFile()).toBe(true)
   })
 
-  test("Path B rejected with feedback propagates message verbatim", async () => {
-    const worktree = await freshWorktree()
-    const feedback = "make the circle bigger"
-    const tool = createRenderSvgTool(resolveOptions({}), {
-      getModel: () => TEXT_ONLY,
-      openFile: async () => {},
-      nextCallSuffix: () => `c${(suffix += 1)}`,
-    })
-    const ctx = makeCtx({
-      worktree,
-      sessionID: "ses-c",
-      ask: async () => {
-        throw new Error(
-          `The user rejected permission to use this specific tool call with the following feedback: ${feedback}`,
-        )
-      },
-    })
-    const err = await tool.execute({ svg: VALID }, ctx).catch((e: unknown) => e)
-    expect((err as Error).message).toContain(feedback)
+  test("forceHumanReview routes a multimodal model to Path B", async () => {
+    const directory = await freshDir()
+    const tool = makeTool({ forceHumanReview: true }, true, directory)
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect(imagesOf(result).length).toBe(0)
+    expect((result.metadata as Record<string, unknown>)["route"]).toBe("human")
   })
 
-  test("forceHumanReview routes multimodal models to Path B", async () => {
-    const worktree = await freshWorktree()
-    let asked = false
-    const tool = createRenderSvgTool(resolveOptions({ forceHumanReview: true }), {
-      getModel: () => MULTIMODAL,
-      openFile: async () => {},
-      nextCallSuffix: () => `d${(suffix += 1)}`,
-    })
-    const ctx = makeCtx({
-      worktree,
-      sessionID: "ses-d",
-      ask: async () => {
-        asked = true
-      },
-    })
-    const result = (await tool.execute({ svg: VALID }, ctx)) as { output: string }
-    expect(asked).toBe(true)
-    expect(result.output).toMatch(/approved/)
+  test("autoOpenViewer=false skips the viewer but still caches", async () => {
+    const directory = await freshDir()
+    const opened: string[] = []
+    const tool = makeTool({ autoOpenViewer: false }, false, directory, opened)
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect(opened).toEqual([])
+    expect((await stat(String((result.metadata as Record<string, unknown>)["png"]))).isFile()).toBe(true)
   })
 
-  test("autoOpenViewer=false skips open but still asks", async () => {
-    const worktree = await freshWorktree()
-    let opened = 0
-    let asked = false
-    const tool = createRenderSvgTool(resolveOptions({ autoOpenViewer: false }), {
-      getModel: () => undefined,
+  test("a failing viewer is swallowed", async () => {
+    const directory = await freshDir()
+    const tool = createRenderSvgTool({
+      options: resolveOptions({}),
+      directory,
+      acceptsImage: async () => false,
       openFile: async () => {
-        opened += 1
+        throw new Error("no viewer here")
       },
-      nextCallSuffix: () => `e${(suffix += 1)}`,
+      nextCallSuffix: () => "v1",
     })
-    const ctx = makeCtx({
-      worktree,
-      sessionID: "ses-e",
-      ask: async () => {
-        asked = true
-      },
-    })
-    await tool.execute({ svg: VALID }, ctx)
-    expect(opened).toBe(0)
-    expect(asked).toBe(true)
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect((result.metadata as Record<string, unknown>)["route"]).toBe("human")
   })
 
-  test("open() failure is swallowed, ask still proceeds", async () => {
-    const worktree = await freshWorktree()
-    let asked = false
-    const tool = createRenderSvgTool(resolveOptions({}), {
-      getModel: () => undefined,
-      openFile: async () => {
-        throw new Error("no viewer")
-      },
-      nextCallSuffix: () => `f${(suffix += 1)}`,
-    })
-    const ctx = makeCtx({
-      worktree,
-      sessionID: "ses-f",
-      ask: async () => {
-        asked = true
-      },
-    })
-    const result = (await tool.execute({ svg: VALID }, ctx)) as { output: string }
-    expect(asked).toBe(true)
-    expect(result.output).toMatch(/approved/)
+  test("invalid SVG returns model-correctable text without rendering or opening", async () => {
+    const directory = await freshDir()
+    const opened: string[] = []
+    const tool = makeTool({}, true, directory, opened)
+    const result = await tool.execute(
+      { svg: '<svg xmlns="http://www.w3.org/2000/svg"><script>x</script></svg>' },
+      makeCtx(),
+    )
+    expect(textOf(result)).toMatch(/script/i)
+    expect(imagesOf(result).length).toBe(0)
+    expect(opened).toEqual([])
+    expect(result.metadata).toBeUndefined()
   })
 
-  test("invalid SVG throws before rasterize/ask/open", async () => {
-    const worktree = await freshWorktree()
-    let asked = false
-    let opened = 0
-    const tool = createRenderSvgTool(resolveOptions({}), {
-      getModel: () => MULTIMODAL,
-      openFile: async () => {
-        opened += 1
-      },
-      nextCallSuffix: () => `g${(suffix += 1)}`,
+  test("bad arguments resolve as text instead of rejecting", async () => {
+    const tool = makeTool({}, true, await freshDir())
+    await expect(tool.execute({ width: 3 }, makeCtx())).resolves.toMatchObject({ content: expect.any(String) })
+  })
+
+  test("rasterize failure resolves as text instead of rejecting", async () => {
+    const tool = createRenderSvgTool({
+      options: resolveOptions({ maxSvgBytes: 10 }),
+      directory: await freshDir(),
+      acceptsImage: async () => true,
+      nextCallSuffix: () => "r1",
     })
-    const ctx = makeCtx({
-      worktree,
-      ask: async () => {
-        asked = true
-      },
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect(textOf(result)).toMatch(/exceeding the 10 byte limit/)
+  })
+
+  test("cache write failure still returns the render", async () => {
+    const tool = createRenderSvgTool({
+      options: resolveOptions({ cacheDir: "/proc/definitely-not-writable" }),
+      directory: process.cwd(),
+      acceptsImage: async () => true,
+      nextCallSuffix: () => "c1",
     })
-    await expect(
-      tool.execute(
-        { svg: '<svg xmlns="http://www.w3.org/2000/svg"><script>x</script></svg>' },
-        ctx,
-      ),
-    ).rejects.toThrow(/script/i)
-    expect(asked).toBe(false)
-    expect(opened).toBe(0)
+    const result = await tool.execute({ svg: VALID }, makeCtx())
+    expect(imagesOf(result).length).toBe(1)
+    const metadata = result.metadata as Record<string, unknown>
+    expect(metadata["svg"]).toBeUndefined()
+    expect(String(metadata["png"])).toContain("/proc/definitely-not-writable")
+  })
+
+  test("metadata never carries undefined (the host encodes it as Json)", async () => {
+    // Regression: an explicit `undefined` in metadata fails the
+    // `session.tool.success` encode, so the tool result is dropped and the model
+    // sees "Provider did not return a tool result" instead of the render.
+    const directory = await freshDir()
+    const encoded = Schema.encodeUnknownSync(Schema.Record(Schema.String, Schema.Json))
+    for (const accepts of [true, false]) {
+      const tool = makeTool({}, accepts, directory)
+      const result = await tool.execute({ svg: VALID }, makeCtx())
+      const values = Object.values((result.metadata ?? {}) as Record<string, unknown>)
+      expect(values.some((value) => value === undefined)).toBe(false)
+      expect(() => encoded(result.metadata)).not.toThrow()
+    }
+  })
+
+  test("call ids keep concurrent renders in separate files", async () => {
+    const directory = await freshDir()
+    const tool = makeTool({}, true, directory)
+    const first = await tool.execute({ svg: VALID }, makeCtx({ id: "call-a" as ToolContext["id"] }))
+    const second = await tool.execute({ svg: VALID }, makeCtx({ id: "call-a" as ToolContext["id"] }))
+    const a = (first.metadata as Record<string, unknown>)["png"]
+    const b = (second.metadata as Record<string, unknown>)["png"]
+    expect(a).not.toBe(b)
+    await rm(directory, { recursive: true, force: true })
   })
 })

@@ -1,8 +1,9 @@
 /**
  * Plugin options and defaults for render_svg.
  *
- * Mirrors PLUGIN.md §8. Options arrive via `Plugin(input, options)` and are
- * merged once at plugin init; `execute` closes over the resolved copy.
+ * Mirrors PLUGIN.md §8. Options arrive as `ctx.options` (the object form in
+ * `opencode.json`: `{ "plugin": [{ "package": "…", "options": { … } }] }`) and
+ * are merged once at plugin setup; the tool closes over the resolved copy.
  */
 
 export type RenderSvgOptions = {

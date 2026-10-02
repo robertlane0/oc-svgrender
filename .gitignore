@@ -1,3 +1,6 @@
 opencode
 node_modules/
 .opencode/render-svg/
+# Local install shim: OpenCode auto-discovers .opencode/plugin(s)/* and watches it,
+# so it is a per-machine detail rather than tracked source. See README.
+.opencode/plugins/

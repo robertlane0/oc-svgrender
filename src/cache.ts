@@ -1,6 +1,9 @@
 /**
  * Render-cache paths + I/O. Layout per PLUGIN.md §4.4:
- *   {worktree}/{cacheDir}/{sessionID}/{callID}.{svg,png}
+ *   {directory}/{cacheDir}/{sessionID}/{callID}.{svg,png}
+ *
+ * `directory` is `ctx.location.directory` in OpenCode v2 (V1 called it the
+ * worktree); `cacheDir` may be absolute or relative to it.
  */
 import path from "node:path"
 import { mkdir, writeFile } from "node:fs/promises"

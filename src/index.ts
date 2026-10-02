@@ -1,52 +1,45 @@
 /**
- * Plugin entry: RenderSvgPlugin.
+ * Plugin entry: render-svg.
  *
- * Bridges `chat.params` (which sees the active Model) to the tool's
- * `execute` (whose ToolContext does not) via a bounded session→model cache.
- * Missing cache entries fall back to the human-review path (safe default).
+ * OpenCode v2 shape: a plugin is `{ id, setup(ctx) }`. Tools are contributed
+ * imperatively from `setup` through `ctx.tool.transform`, options arrive as
+ * `ctx.options`, and the working directory is `ctx.location.directory`.
+ *
+ * `session.hook("model.request")` feeds the session→model cache that decides
+ * between the multimodal and human routes; see `models.ts`.
  */
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
 import { resolveOptions } from "./config.ts"
 import type { RenderSvgOptions } from "./config.ts"
+import { attachModelCapabilities } from "./models.ts"
 import { createRenderSvgTool } from "./render_svg.ts"
-import type { ModelLike } from "./render_svg.ts"
 
-const MAX_SESSIONS = 200
+export const ID = "render-svg"
 
-export const modelBySession = new Map<string, ModelLike>()
-
-export function trackModel(sessionID: string, model: ModelLike): void {
-  if (modelBySession.has(sessionID)) {
-    modelBySession.delete(sessionID)
-  }
-  modelBySession.set(sessionID, model)
-  while (modelBySession.size > MAX_SESSIONS) {
-    const oldest = modelBySession.keys().next()
-    if (oldest.done === true) break
-    modelBySession.delete(oldest.value)
-  }
-}
-
-export function clearModelCache(): void {
-  modelBySession.clear()
-}
-
-export const RenderSvgPlugin: Plugin = async (_input, rawOptions) => {
-  const options = resolveOptions(rawOptions as RenderSvgOptions | undefined)
-  const renderSvg = createRenderSvgTool(options, {
-    getModel: (sessionID) => modelBySession.get(sessionID),
-  })
-  return {
-    "chat.params": async (input) => {
-      trackModel(input.sessionID, input.model as unknown as ModelLike)
-    },
-    tool: {
-      render_svg: renderSvg,
-    },
-    dispose: async () => {
-      clearModelCache()
-    },
-  }
-}
+export const RenderSvgPlugin = {
+  id: ID,
+  async setup(ctx: Plugin.Context) {
+    const options = resolveOptions(ctx.options as RenderSvgOptions | undefined)
+    const directory = ctx.location.directory
+    const { capabilities, dispose: disposeModels } = await attachModelCapabilities(ctx)
+    // Warm the model catalog here, where latency is free: the first render of a
+    // session must not wait on a cold `ctx.model.list()`.
+    void capabilities.prefetch()
+    const registration = await ctx.tool.transform((editor) => {
+      editor.add(
+        createRenderSvgTool({
+          options,
+          directory,
+          acceptsImage: (sessionID) => capabilities.acceptsImage(sessionID),
+        }),
+      )
+    })
+    return async () => {
+      capabilities.clear()
+      await disposeModels()
+      await registration.dispose()
+    }
+  },
+} satisfies Plugin.Plugin
 
 export default RenderSvgPlugin

@@ -39,6 +39,16 @@ describe("rasterizeSvg", () => {
     )
   })
 
+  test("wasm init is memoized process-wide, not per module copy", async () => {
+    await rasterizeSvg(RED_RECT, { background: "white" })
+    const scope = globalThis as { [key: symbol]: unknown }
+    expect(scope[Symbol.for("opencode-plugin-render-svg/resvg-wasm")]).toBeInstanceOf(Promise)
+    // A reloaded copy of this module (plugin hot reload) resolves the same memo,
+    // so resvg's one-shot `initWasm` is never called twice in one process.
+    const second = await rasterizeSvg(RED_RECT, { background: "white" })
+    expect(second.width).toBe(100)
+  })
+
   test("no network fetch on external image ref (renders blank, does not throw/fetch)", async () => {
     let fetched = false
     const origFetch = globalThis.fetch
